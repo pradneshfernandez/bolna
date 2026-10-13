@@ -56,7 +56,9 @@ class RimeSynthesizer(StreamSynthesizer):
         self.use_mulaw = True
         self.caching = caching
 
-        self.ws_url = f"wss://users.rime.ai/ws2?speaker={self.voice_id}&modelId={self.model}&audioFormat=mulaw&samplingRate={self.sample_rate}"
+        # segment=never: Rime synthesizes only on flush and sends one "done" per non-empty flush, so the
+        # reply's end can be counted. The default (bySentence) sends one per sentence it splits out.
+        self.ws_url = f"wss://users.rime.ai/ws2?speaker={self.voice_id}&modelId={self.model}&audioFormat=mulaw&samplingRate={self.sample_rate}&segment=never"
         if self.supports_time_scale:
             self.ws_url += f"&timeScaleFactor={self.time_scale_factor}"
         self.api_url = "https://users.rime.ai/v1/rime-tts"
@@ -66,7 +68,14 @@ class RimeSynthesizer(StreamSynthesizer):
             self.stream = False
 
         self.context_id = None
-        self.audio_data = b""
+        # contextId -> flushes with text still awaiting their "done"
+        self.pending_dones = {}
+        # contextIds whose reply has had all its text sent; their last "done" ends the reply
+        self.finished_contexts = set()
+        self.text_since_flush = False
+        # Wakes the receiver when a reply finishes with nothing left to wait for (Rime sends no
+        # "done" for an empty flush, so nothing would arrive to end it).
+        self.reply_finished = asyncio.Event()
 
         if caching:
             self.cache = InmemoryScalarCache()
@@ -106,6 +115,11 @@ class RimeSynthesizer(StreamSynthesizer):
             try:
                 if self.context_id:
                     self.context_id = str(uuid.uuid4())
+                    # The interrupted reply's "done"s no longer end anything, so start the next turn fresh.
+                    self.pending_dones.clear()
+                    self.finished_contexts.clear()
+                    self.text_since_flush = False
+                    self.current_turn_start_time = None
                     await self.websocket.send(json.dumps({"operation": "clear"}))
             except Exception:
                 pass
@@ -135,17 +149,25 @@ class RimeSynthesizer(StreamSynthesizer):
                         if self.ws_send_time is None:
                             self.ws_send_time = time.perf_counter()
                         await self._send_json({"text": text_chunk, "contextId": self.context_id})
+                        self.text_since_flush = True
                     except Exception as e:
                         logger.info(f"Error sending chunk: {e}")
                         self.connection_error = str(e)
                         return
 
+            context_id = self.context_id
             if end_of_llm_stream:
                 self.last_text_sent = True
                 self.context_id = str(uuid.uuid4())
 
             try:
                 await self._send_json({"operation": "flush"})
+                if self.text_since_flush:
+                    self.pending_dones[context_id] = self.pending_dones.get(context_id, 0) + 1
+                    self.text_since_flush = False
+                if end_of_llm_stream:
+                    self.finished_contexts.add(context_id)
+                    self.reply_finished.set()
             except Exception as e:
                 logger.info(f"Error sending end-of-stream signal: {e}")
                 self.connection_error = str(e)
@@ -155,48 +177,86 @@ class RimeSynthesizer(StreamSynthesizer):
         except Exception as e:
             logger.error(f"Unexpected error in sender: {e}")
 
+    def _take_settled_replies(self):
+        """Finished replies with no flush still awaiting its "done"; each needs its end-of-stream."""
+        settled = [ctx for ctx in self.finished_contexts if ctx not in self.pending_dones]
+        self.finished_contexts.difference_update(settled)
+        return len(settled)
+
     async def receiver(self):
         not_connected_since = None
-        while True:
-            try:
-                if self.conversation_ended:
-                    return
-                if not self._is_ws_connected():
-                    if self.connection_error:
+        recv_task = None
+        try:
+            while True:
+                try:
+                    if self.conversation_ended:
                         return
-                    now = time.perf_counter()
-                    if not_connected_since is None:
-                        not_connected_since = now
-                    elif now - not_connected_since > 30:
-                        logger.error("Rime receiver: WebSocket never connected after 30s, giving up.")
-                        self.connection_error = self.connection_error or "WebSocket never connected"
-                        return
-                    logger.info("WebSocket is not connected, skipping receive.")
-                    await asyncio.sleep(0.1)
-                    continue
-                else:
-                    not_connected_since = None
+                    if not self._is_ws_connected():
+                        if recv_task is not None:
+                            recv_task.cancel()
+                            recv_task = None
+                        if self.connection_error:
+                            return
+                        now = time.perf_counter()
+                        if not_connected_since is None:
+                            not_connected_since = now
+                        elif now - not_connected_since > 30:
+                            logger.error("Rime receiver: WebSocket never connected after 30s, giving up.")
+                            self.connection_error = self.connection_error or "WebSocket never connected"
+                            return
+                        logger.info("WebSocket is not connected, skipping receive.")
+                        await asyncio.sleep(0.1)
+                        continue
+                    else:
+                        not_connected_since = None
 
-                response = await self.websocket.recv()
-                data = json.loads(response)
+                    self.reply_finished.clear()
+                    for _ in range(self._take_settled_replies()):
+                        yield b"\x00"
 
-                if data.get("type", "") == "chunk":
-                    self.audio_data += base64.b64decode(data["data"])
+                    # Wait for the next frame, or for the sender finishing a reply that has nothing
+                    # left to wait for. The pending recv is kept across wake-ups, never cancelled.
+                    if recv_task is None:
+                        recv_task = asyncio.ensure_future(self.websocket.recv())
+                    waker = asyncio.ensure_future(self.reply_finished.wait())
+                    try:
+                        await asyncio.wait({recv_task, waker}, return_when=asyncio.FIRST_COMPLETED)
+                    finally:
+                        waker.cancel()
+                    if not recv_task.done():
+                        continue
+                    task, recv_task = recv_task, None
+                    data = json.loads(task.result())
 
-                if data["type"] == "timestamps":
-                    yield self.audio_data
-                    self.audio_data = b""
+                    msg_type = data.get("type")
+                    if msg_type == "chunk":
+                        yield base64.b64decode(data["data"])
+                    elif msg_type == "done":
+                        ctx = data.get("contextId")
+                        if ctx in self.pending_dones:
+                            self.pending_dones[ctx] -= 1
+                            if self.pending_dones[ctx] <= 0:
+                                del self.pending_dones[ctx]
+                        # A reply ends once every flush of its text has been synthesized.
+                        for _ in range(self._take_settled_replies()):
+                            yield b"\x00"
+                    elif msg_type == "error":
+                        logger.error(f"Rime TTS error: {data.get('message')}")
 
-                chunk_context_id = data.get("contextId")
-                if chunk_context_id != self.context_id:
-                    yield b"\x00"
-                else:
-                    logger.info("No audio data in the response")
-
-            except websockets.exceptions.ConnectionClosed:
-                break
-            except Exception as e:
-                logger.error(f"Error occurred in receiver - {e}")
+                except websockets.exceptions.ConnectionClosed as e:
+                    # Rime closes the socket (1011) on text it can't speak, e.g. an emoji-only push or
+                    # an overlong sentence. The reply in flight gets no "done"; end it here.
+                    logger.error(f"Rime WebSocket closed: {e}")
+                    if self.pending_dones or self.finished_contexts:
+                        self.pending_dones.clear()
+                        self.finished_contexts.clear()
+                        yield b"\x00"
+                    break
+                except Exception as e:
+                    logger.error(f"Error occurred in receiver - {e}")
+        finally:
+            if recv_task is not None:
+                recv_task.cancel()
 
     # ------------------------------------------------------------------
     # Connection
